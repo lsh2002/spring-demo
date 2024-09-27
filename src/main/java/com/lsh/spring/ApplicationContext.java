@@ -1,26 +1,33 @@
 package com.lsh.spring;
 
+import com.lsh.spring.annotation.Autowired;
 import com.lsh.spring.annotation.Component;
 import com.lsh.spring.annotation.ComponentScan;
 import com.lsh.spring.annotation.Scope;
 import com.lsh.spring.bean.BeanDefinition;
+import com.lsh.spring.bean.BeanNameAware;
+import com.lsh.spring.bean.BeanPostProcessor;
+import com.lsh.spring.bean.InitializingBean;
 
+import java.beans.Introspector;
 import java.io.File;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * @author lsh
  * @version 1.0.0
- * @description
- * @date 2024/9/26 13:56
+ * @since  2024/9/26 13:56
  **/
 public class ApplicationContext {
 
-    private Class config;
+    private Class<?> config;
 
     /**
      * bean定义map
@@ -32,13 +39,18 @@ public class ApplicationContext {
      */
     private ConcurrentHashMap<String, Object> singletonMap = new ConcurrentHashMap<>();
 
-    public ApplicationContext(Class configClass) throws URISyntaxException {
+    /**
+     * 后处理器
+     */
+    private List<BeanPostProcessor> beanPostProcessorList = new ArrayList<>();
+
+    public ApplicationContext(Class<?> configClass) throws URISyntaxException {
         this.config = configClass;
 
         // 扫描
         // 获取扫描路径
         if (config.isAnnotationPresent(ComponentScan.class)) {
-            ComponentScan componentScan = (ComponentScan) config.getAnnotation(ComponentScan.class);
+            ComponentScan componentScan = config.getAnnotation(ComponentScan.class);
             String path = componentScan.value();
             // 转换为文件路径
             String filePath = path.replace(".", "/");
@@ -64,20 +76,29 @@ public class ApplicationContext {
                             // 根据全限定名加载类
                             try {
                                 Class<?> aClass = classLoader.loadClass(classPath);
+                                // 判断是否实现了BeanPostProcessor
+                                if (BeanPostProcessor.class.isAssignableFrom(aClass)) {
+                                    // 实例化后放入集合
+                                    beanPostProcessorList.add((BeanPostProcessor) aClass.getDeclaredConstructor().newInstance());
+                                }
                                 // 判断是否为bean
                                 if (aClass.isAnnotationPresent(Component.class)) {
                                     // 创建bean定义
                                     BeanDefinition beanDefinition = createBeanDefinition(aClass);
-                                    // 获取bean名称
                                     Component component = aClass.getAnnotation(Component.class);
-                                    // 将bean定义放入map中
+                                    String beanName = component.value();
+                                    // 如果为空则使用类名作为bean名称
                                     if ("".equals(component.value())) {
-                                        beanDefinitionMap.put(aClass.getSimpleName(), beanDefinition);
-                                    } else {
-                                        beanDefinitionMap.put(component.value(), beanDefinition);
+                                        beanName = Introspector.decapitalize(aClass.getSimpleName());
                                     }
+                                    // 将bean定义放入map中
+                                    beanDefinitionMap.put(beanName, beanDefinition);
                                 }
-                            } catch (ClassNotFoundException e) {
+                            } catch (ClassNotFoundException | InstantiationException | IllegalAccessException e) {
+                                throw new RuntimeException(e);
+                            } catch (NoSuchMethodException e) {
+                                throw new RuntimeException(e);
+                            } catch (InvocationTargetException e) {
                                 throw new RuntimeException(e);
                             }
                         }
@@ -87,15 +108,14 @@ public class ApplicationContext {
         }
 
         // 实例化单例bean
-        for (String beanName : beanDefinitionMap.keySet()) {
-            BeanDefinition beanDefinition = beanDefinitionMap.get(beanName);
+        beanDefinitionMap.forEach((beanName, beanDefinition) -> {
             // 单例的bean则 直接创建bean对象
             if ("singleton".equals(beanDefinition.getScope())) {
                 Object bean = createBean(beanName, beanDefinition);
                 // 将bean放入单例池中
                 singletonMap.put(beanName, bean);
             }
-        }
+        });
     }
 
     /**
@@ -113,13 +133,8 @@ public class ApplicationContext {
             // 从单例池中获取bean
             Object bean = singletonMap.get(beanName);
             if (bean == null) {
-                synchronized (this) {
-                    if (bean == null) {
-                        Object singletonBean = createBean(beanName, beanDefinition);
-                        singletonMap.put(beanName, singletonBean);
-                        return singletonBean;
-                    }
-                }
+                bean = createBean(beanName, beanDefinition);
+                singletonMap.put(beanName, bean);
             }
             return bean;
         }
@@ -137,9 +152,46 @@ public class ApplicationContext {
     private Object createBean(String beanName, BeanDefinition beanDefinition) {
         Class<?> clazz = beanDefinition.getClazz();
         try {
-            Object bean = clazz.getConstructor().newInstance();
+            Object instance = clazz.getConstructor().newInstance();
+            // 依赖注入
+            Field[] declaredFields = instance.getClass().getDeclaredFields();
+            for (Field declaredField : declaredFields) {
+                if (declaredField.isAnnotationPresent(Autowired.class)) {
+                    declaredField.setAccessible(true);
+                    String injectBeanName = declaredField.getName();
+                    // 不存在该bean
+                    if (!beanDefinitionMap.contains(injectBeanName)) {
+                        // 找到实现类
+                        for (BeanDefinition value : beanDefinitionMap.values()) {
+                            if (declaredField.getType().isAssignableFrom(value.getClazz())) {
+                                injectBeanName = Introspector.decapitalize(value.getClazz().getSimpleName());
+                            }
+                        }
+                    }
+                    Object injectBean = getBean(injectBeanName);
+                    declaredField.set(instance, injectBean);
+                }
+            }
+            // Aware
+            if (instance instanceof BeanNameAware beanNameAware) {
+                beanNameAware.setBeanName(beanName);
+            }
+            // 初始化前
+            for (BeanPostProcessor beanPostProcessor : beanPostProcessorList) {
+                instance = beanPostProcessor.postProcessBeforeInitialization(instance, beanName);
+            }
+            // 初始化
+            if (instance instanceof InitializingBean initializingBean) {
+                initializingBean.afterPropertiesSet();
+            }
+            // 初始化后
+            for (BeanPostProcessor beanPostProcessor : beanPostProcessorList) {
+                instance = beanPostProcessor.postProcessAfterInitialization(instance, beanName);
+            }
 
-            return bean;
+
+
+            return instance;
         } catch (InstantiationException e) {
             throw new RuntimeException(e);
         } catch (IllegalAccessException e) {
